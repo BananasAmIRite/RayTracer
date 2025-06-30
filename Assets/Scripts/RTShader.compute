@@ -34,14 +34,6 @@ RWTexture2D<float4> Result;
 RWStructuredBuffer<MaterialTriangle> triangles; 
 RWStructuredBuffer<float3> rtLightTotal;
 
-// Spatial partitioning data
-RWStructuredBuffer<int> gridCells; // Stores triangle indices for each grid cell
-RWStructuredBuffer<int> gridOffsets; // Starting index for each grid cell in gridCells
-RWStructuredBuffer<int> gridCounts; // Number of triangles in each grid cell
-float3 gridMin; // Minimum bounds of the grid
-float3 gridMax; // Maximum bounds of the grid
-int3 gridDimensions; // Number of cells in each dimension
-
 int width; 
 int height; 
 int iterations; 
