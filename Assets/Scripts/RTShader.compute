@@ -1,0 +1,270 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+struct Ray {
+    float3 position; 
+    float3 direction; 
+};
+
+struct MaterialTriangle {
+    float3 a; 
+    float3 b; 
+    float3 c; 
+    float4 emissionColor; 
+    float4 materialColor; 
+    float emission; 
+    float roughness;
+};
+
+struct RaycastResult {
+    Ray initial; 
+    Ray final; 
+    MaterialTriangle surface; 
+    float dist; 
+
+    bool success; 
+};
+
+// const float PI = 3.14159f;
+static const float PI = 3.14159265f; 
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+RWStructuredBuffer<MaterialTriangle> triangles; 
+RWStructuredBuffer<float3> rtLightTotal;
+
+// Spatial partitioning data
+RWStructuredBuffer<int> gridCells; // Stores triangle indices for each grid cell
+RWStructuredBuffer<int> gridOffsets; // Starting index for each grid cell in gridCells
+RWStructuredBuffer<int> gridCounts; // Number of triangles in each grid cell
+float3 gridMin; // Minimum bounds of the grid
+float3 gridMax; // Maximum bounds of the grid
+int3 gridDimensions; // Number of cells in each dimension
+
+int width; 
+int height; 
+int iterations; 
+
+int trianglesSize; 
+
+int samplesPerPixel;
+
+float3 cameraPosition;
+float3 cameraUp; 
+float3 cameraRight; 
+float3 cameraForward; 
+float nearClip;
+float fovDegrees; 
+float aspectRatio;
+
+int frameCount;
+
+uint rngState = 0;
+
+// Random number generation for diffuse reflection
+uint hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+float randomFloat()
+{
+    rngState = hash(rngState);
+    return float(rngState) / 4294967296.0;
+}
+
+// rand unit vector using polar coordinates (for uniformity)
+float3 randomUnitVector()
+{
+    float z = randomFloat() * 2.0 - 1.0; // [-1, 1] for z component
+    float a = randomFloat() * 2.0 * PI; // [0, 2pi]
+    float r = sqrt(1.0 - z * z); //  "flat" projection onto x-y plane
+    float x = r * cos(a); // compute flat components using flat projection
+    float y = r * sin(a);
+    return float3(x, y, z);
+}
+
+// random vector in hemisphere defined by normal vector
+float3 randomHemisphereVector(float3 normal)
+{
+    float3 inUnitSphere = randomUnitVector();
+    if (dot(inUnitSphere, normal) > 0.0) 
+    {
+        // In same hemisphere as normal, we're good
+        return inUnitSphere;
+    } else {
+        // opposite hemisphere, return opposite
+        return -inUnitSphere;
+    }
+}
+
+
+// calc normal given 3 points of triangle
+float3 normal(float3 a, float3 b, float3 c) {
+    float3 ab = b - a; 
+    float3 ac = c - a; 
+    return normalize(cross(ab, ac));  // A, B, C of the normal vector = Ax + By + Cz = d of the plane
+}
+
+// calc if a ray hits a plane given by triangle coords
+// ** returns float4: xyz + 1 bit of success
+float4 intersectPlane(float3 a, float3 b, float3 c, Ray ray) {
+    float3 norm = normal(a, b, c); 
+
+    float t = (norm.x * (a.x - ray.position.x) + norm.y * (a.y - ray.position.y) + norm.z * (a.z - ray.position.z)) / (norm.x * ray.direction.x + norm.y * ray.direction.y + norm.z * ray.direction.z); 
+
+    if (t <= 0) return float4(0, 0, 0, 0);
+    
+    float3 output = ray.position + t * ray.direction; 
+    return float4(output.x, output.y, output.z, 1); 
+}
+
+// compute whether point is in the triangle
+bool inTriangle(float3 a, float3 b, float3 c, float3 pt) {
+    float3 v0 = c - a; 
+    float3 v1 = b - a; 
+    float3 v2 = pt - a;
+
+    float dot00 = dot(v0, v0);
+    float dot01 = dot(v0, v1);
+    float dot02 = dot(v0, v2);
+    float dot11 = dot(v1, v1);
+    float dot12 = dot(v1, v2); 
+
+    float denom = dot00 * dot11 - dot01 * dot01;
+    if (denom == 0) return false; 
+
+    float u = (dot11 * dot02 - dot01 * dot12) / denom; 
+    float v = (dot00 * dot12 - dot01 * dot02) / denom; 
+
+    return u >= 0 && v >= 0 && u + v <= 1;
+}
+
+// specular reflection (bounce based off normal vector)
+float3 bounce(float3 normal, float3 vec) {
+    return vec - 2 * dot(vec, normal) * normal; 
+}
+
+
+// blended version between specular and diffuse reflection using lerp
+float3 blendReflection(float3 normal, float3 incoming, float roughness)
+{
+    // Specular reflection
+    float3 specular = bounce(normal, incoming);
+    
+    // Diffuse reflection
+    float3 diffuse = randomHemisphereVector(normal);
+    
+    // Blend based on roughness (0 = pure specular, 1 = pure diffuse)
+    return normalize(lerp(specular, diffuse, roughness));
+}
+
+RaycastResult raycast(RWStructuredBuffer<MaterialTriangle> triangles, Ray initial) {
+
+    // initial result, unsuccessful
+    RaycastResult current; 
+    current.dist = 100000000;
+    current.success = false; 
+
+    for (int i = 0; i < trianglesSize; i++) {
+        float3 a = triangles[i].a; 
+        float3 b = triangles[i].b; 
+        float3 c = triangles[i].c; 
+
+        // calc intersected point with plane in direction of ray
+        float4 intersectedPoint = intersectPlane(a, b, c, initial); 
+        if (intersectedPoint[3] == 0) continue; 
+        // check if inside triangle given by abc
+        bool inside = inTriangle(a, b, c, intersectedPoint.xyz); 
+        if (inside) {
+            // find surface normal
+            float3 norm = normal(a, b, c); 
+            
+            // Use blended reflection based on surface roughness
+            float3 reflectionDirection = blendReflection(norm, initial.direction, triangles[i].roughness);
+            
+            Ray r; 
+            r.position = intersectedPoint.xyz + norm * 0.001; // Small offset to prevent self-intersection
+            r.direction = normalize(reflectionDirection); 
+
+            // construct new result
+            RaycastResult res; 
+            res.initial = initial; 
+            res.final = r; 
+            res.surface = triangles[i];
+            res.dist = length(initial.position - intersectedPoint.xyz);
+            res.success = true; 
+
+            // only take the closest object
+            if (res.dist < current.dist) current = res;
+        }
+    }
+    return current; 
+}
+
+
+[numthreads(32,32,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x; 
+    int y = id.y; 
+    
+    // check bounds
+    if (x >= width || y >= height) return; 
+
+    // init random number generator with a unique seed per pixel
+    rngState = ((y * width + x) + frameCount * 12345) * 747796405u + 2891336453u;
+
+    // calc clip plane dimensions of camera
+    float planeHeight = 2 * nearClip * tan(fovDegrees * PI / 180 / 2);
+    float planeWidth = planeHeight * aspectRatio;
+
+    // calc x and y coordinates of clip plane to sample
+    float horizontal = planeWidth / width * x; 
+    float vertical = planeHeight / height * y; 
+
+    // vector from camera to point
+    float3 cameraToPoint = float3(-planeWidth / 2 + horizontal, -planeHeight / 2 + vertical, nearClip);
+
+    Ray camRay;
+    camRay.position = cameraPosition; 
+    camRay.direction = normalize(cameraToPoint); 
+
+    // raycast!!
+    float3 totalLight = 0; 
+    float3 rayColor = 1; 
+    Ray sampleRay = camRay;
+
+    for (int i = 0; i < iterations; i++) {
+        RaycastResult res = raycast(triangles, sampleRay);
+
+        if (!res.success) {
+            // Add sky color/ambient lighting when ray doesn't hit anything
+            float3 skyColor = float3(0.5, 0.7, 1.0); // Light blue sky
+            totalLight += rayColor * skyColor * 0.3; // Ambient contribution
+            break; 
+        }
+
+        // Add emission from the surface
+        totalLight += rayColor * res.surface.emissionColor.rgb * res.surface.emission; 
+        
+        // Attenuate ray color by surface material
+        rayColor *= res.surface.materialColor.rgb; 
+
+        sampleRay = res.final; 
+    }
+
+    // average light over multiple frames (TODO: fix potential overflow?)
+    rtLightTotal[id.y * width + id.x] += totalLight; 
+    float3 avgLight = rtLightTotal[id.y * width + id.x] / float(frameCount); 
+
+    // display
+    Result[id.xy] = float4(avgLight.x, avgLight.y, avgLight.z, 1); 
+    
+}
